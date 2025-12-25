@@ -8,8 +8,21 @@ import json
 import logging
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+# Import caching module
+from mopidy_qobuz.cache import album_cache, track_cache, artist_cache, artwork_cache
+
+# Import rate limiter
+from mopidy_qobuz.rate_limiter import get_rate_limiter
+
+# Client version
+CLIENT_VERSION = "0.3.0"
+
+# Extension update marker - helps identify updated code in logs
+EXTENSION_VERSION = "NEW QOBUZ EXTENSION v2025.01.20.1 - Search result caching"
 
 
 class QobuzException(Exception):
@@ -55,7 +68,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 
 class Client:
-    def __init__(self, app_id=None, secret=None, user_agent=None, session=None):
+    def __init__(self, app_id=None, secret=None, user_agent=None, session=None, config=None):
         self.secret = str(secret)
         self.app_id = str(app_id)
         self._session = session or requests.Session()
@@ -64,6 +77,24 @@ class Client:
         )
         self._label = None
         self._logged_in = False
+        self._config = config or {}
+
+        # OAuth support
+        self._oauth_access_token = None
+        self._oauth_refresh_token = None
+        self._oauth_expires_at = None
+        self._using_oauth = False
+
+        # Thread pool for async HTTP calls (fire-and-forget reporting)
+        self._http_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="qobuz-http"
+        )
+
+        # Log initialization with version marker
+        logger.info(f"[{EXTENSION_VERSION}] Qobuz Client initialized")
+        logger.info(f"[{EXTENSION_VERSION}] Client version: {CLIENT_VERSION}")
+        logger.info(f"[{EXTENSION_VERSION}] App ID: {app_id[:20]}..." if app_id else f"[{EXTENSION_VERSION}] App ID: None")
 
     def login(self, email: str, password: str, force=False):
         if not self._logged_in or force:
@@ -101,14 +132,210 @@ class Client:
         logger.info("Logged: OK // Qobuz membership: %s", self._label)
 
     def get(self, endpoint: str, params: dict, raise_for_status=True):
-        logger.debug("Making a call: %s - %s", endpoint, params)
-        response = self._session.get(f"{BASE_URL}/{endpoint}", params=params)
+        # Start timing for detailed logging
+        start_time = time.time()
+
+        # Enable verbose logging if configured
+        verbose = self._config.get("verbose_logging", False)
+        # Detailed API logging can be enabled via config (currently disabled)
+        detailed = False
+
+        # Check if OAuth token is expired and attempt auto-refresh
+        if self._using_oauth and self._is_token_expired():
+            logger.warning(f"[{EXTENSION_VERSION}] OAuth token is EXPIRED! Attempting automatic refresh...")
+
+            # Trigger refresh via backend's perform_token_refresh if available
+            if hasattr(self, '_backend_refresh_callback') and self._backend_refresh_callback:
+                try:
+                    success = self._backend_refresh_callback()
+                    if success:
+                        logger.info(f"[{EXTENSION_VERSION}] ✓ Token auto-refreshed successfully")
+                    else:
+                        logger.error(f"[{EXTENSION_VERSION}] ✗ Token auto-refresh failed - API call will likely fail")
+                except Exception as e:
+                    logger.error(f"[{EXTENSION_VERSION}] ✗ Exception during token auto-refresh: {e}")
+            else:
+                logger.error(f"[{EXTENSION_VERSION}] No refresh callback available - API call may fail")
+
+        # Apply rate limiting for specific endpoints (album/get, track/get, artist/get)
+        rate_limiter = get_rate_limiter()
+        wait_time = rate_limiter.wait_if_needed(endpoint)
+        if wait_time > 0:
+            logger.debug(f"[RATE LIMITER] {endpoint} - waited {wait_time:.2f}s for rate limit")
+
+        # Log API call details with version marker
+        auth_info = self._get_auth_info()
+
+        # API Monitor detailed logging
+        if detailed:
+            logger.info(f"[API CALL] >>> GET {endpoint}")
+            logger.info(f"[API CALL]     Params: {params}")
+            logger.info(f"[API CALL]     Auth: {auth_info}")
+
+        if verbose:
+            logger.info(f"[{EXTENSION_VERSION}] GET {BASE_URL}/{endpoint}")
+            logger.info(f"[{EXTENSION_VERSION}] Auth: {auth_info}")
+            logger.info(f"[{EXTENSION_VERSION}] Parameters: {params}")
+        else:
+            # Log at INFO level for API call tracking
+            logger.info(f"[API] >>> GET {endpoint} | Params: {params}")
+            logger.debug(f"[{EXTENSION_VERSION}] GET {endpoint} | Auth: {auth_info}")
+            logger.debug(f"[{EXTENSION_VERSION}] Parameters: {params}")
+
+        # Log headers being sent (sanitized)
+        headers_log = {k: (v[:20] + "..." if k == "Authorization" else v)
+                      for k, v in self._session.headers.items()}
+        if verbose:
+            logger.info(f"[{EXTENSION_VERSION}] Request headers: {headers_log}")
+        else:
+            logger.debug(f"[{EXTENSION_VERSION}] Headers: {headers_log}")
+
+        # Add timeout to prevent indefinite waits
+        # Use tuple (connect_timeout, read_timeout) to timeout both connection AND data transfer
+        response = self._session.get(f"{BASE_URL}/{endpoint}", params=params, timeout=(3.0, 5.0))
+
+        # Calculate duration
+        duration_ms = (time.time() - start_time) * 1000
+
+        # Log response at INFO level for tracking
+        logger.info(f"[API] <<< {response.status_code} {endpoint} ({duration_ms:.0f}ms)")
+
+        # API Monitor detailed logging
+        if detailed:
+            logger.info(f"[API CALL] <<< {response.status_code} {endpoint} ({duration_ms:.1f}ms)")
+            if response.status_code >= 400:
+                logger.error(f"[API CALL]     Error: {response.text[:200]}")
+            else:
+                try:
+                    response_preview = str(response.json())[:500]
+                    logger.info(f"[API CALL]     Response: {response_preview}...")
+                except:
+                    pass
+
+        # Log response with version marker - INFO/ERROR for visibility
+        if response.status_code != 200:
+            logger.error(f"[{EXTENSION_VERSION}] GET {endpoint} FAILED: {response.status_code}")
+            logger.error(f"[{EXTENSION_VERSION}] Error response: {response.text[:200]}")
+        else:
+            if verbose:
+                logger.info(f"[{EXTENSION_VERSION}] Response: {response.status_code} OK | Endpoint: {endpoint}")
+                try:
+                    response_preview = str(response.json())[:200]
+                    logger.info(f"[{EXTENSION_VERSION}] Response preview: {response_preview}...")
+                except:
+                    pass
+            else:
+                logger.debug(f"[{EXTENSION_VERSION}] Response: {response.status_code} | Endpoint: {endpoint}")
+
         return _handle_response(response, raise_for_status)
 
     def post(self, endpoint: str, data: dict, raise_for_status=True):
-        logger.debug("Making a call: %s - %s", endpoint, data)
-        response = self._session.post(f"{BASE_URL}/{endpoint}", data=data)
+        # Start timing for detailed logging
+        start_time = time.time()
+
+        # Enable verbose logging if configured
+        verbose = self._config.get("verbose_logging", False)
+        # Detailed API logging can be enabled via config (currently disabled)
+        detailed = False
+
+        # Check if OAuth token is expired and attempt auto-refresh
+        if self._using_oauth and self._is_token_expired():
+            logger.warning(f"[{EXTENSION_VERSION}] OAuth token is EXPIRED! Attempting automatic refresh...")
+
+            # Trigger refresh via backend's perform_token_refresh if available
+            if hasattr(self, '_backend_refresh_callback') and self._backend_refresh_callback:
+                try:
+                    success = self._backend_refresh_callback()
+                    if success:
+                        logger.info(f"[{EXTENSION_VERSION}] ✓ Token auto-refreshed successfully")
+                    else:
+                        logger.error(f"[{EXTENSION_VERSION}] ✗ Token auto-refresh failed - API call will likely fail")
+                except Exception as e:
+                    logger.error(f"[{EXTENSION_VERSION}] ✗ Exception during token auto-refresh: {e}")
+            else:
+                logger.error(f"[{EXTENSION_VERSION}] No refresh callback available - API call may fail")
+
+        # Apply rate limiting for specific endpoints (album/get, track/get, artist/get)
+        rate_limiter = get_rate_limiter()
+        wait_time = rate_limiter.wait_if_needed(endpoint)
+        if wait_time > 0:
+            logger.debug(f"[RATE LIMITER] {endpoint} - waited {wait_time:.2f}s for rate limit")
+
+        # Log API call details with version marker
+        auth_info = self._get_auth_info()
+
+        # API Monitor detailed logging
+        if detailed:
+            logger.info(f"[API CALL] >>> POST {endpoint}")
+            logger.info(f"[API CALL]     Data: {data}")
+            logger.info(f"[API CALL]     Auth: {auth_info}")
+
+        if verbose:
+            logger.info(f"[{EXTENSION_VERSION}] POST {BASE_URL}/{endpoint}")
+            logger.info(f"[{EXTENSION_VERSION}] Auth: {auth_info}")
+            logger.info(f"[{EXTENSION_VERSION}] Data: {data}")
+        else:
+            # Log at INFO level for API call tracking
+            logger.info(f"[API] >>> POST {endpoint}")
+            logger.debug(f"[{EXTENSION_VERSION}] POST {endpoint} | Auth: {auth_info}")
+            logger.debug(f"[{EXTENSION_VERSION}] Data: {data}")
+
+        # Log headers being sent (sanitized)
+        headers_log = {k: (v[:20] + "..." if k == "Authorization" else v)
+                      for k, v in self._session.headers.items()}
+        if verbose:
+            logger.info(f"[{EXTENSION_VERSION}] Request headers: {headers_log}")
+        else:
+            logger.debug(f"[{EXTENSION_VERSION}] Headers: {headers_log}")
+
+        # Add timeout to prevent indefinite waits
+        # Use tuple (connect_timeout, read_timeout) to timeout both connection AND data transfer
+        response = self._session.post(f"{BASE_URL}/{endpoint}", data=data, timeout=(3.0, 5.0))
+
+        # Calculate duration
+        duration_ms = (time.time() - start_time) * 1000
+
+        # Log response at INFO level for tracking
+        logger.info(f"[API] <<< {response.status_code} {endpoint} ({duration_ms:.0f}ms)")
+
+        # API Monitor detailed logging
+        if detailed:
+            logger.info(f"[API CALL] <<< {response.status_code} {endpoint} ({duration_ms:.1f}ms)")
+            if response.status_code >= 400:
+                logger.error(f"[API CALL]     Error: {response.text[:200]}")
+            else:
+                try:
+                    response_preview = str(response.json())[:500]
+                    logger.info(f"[API CALL]     Response: {response_preview}...")
+                except:
+                    pass
+
+        # Log response with version marker - INFO/ERROR for visibility
+        if response.status_code in [200, 201]:
+            if verbose:
+                logger.info(f"[{EXTENSION_VERSION}] Response: {response.status_code} OK | Endpoint: {endpoint}")
+                try:
+                    response_preview = str(response.json())[:200]
+                    logger.info(f"[{EXTENSION_VERSION}] Response preview: {response_preview}...")
+                except:
+                    pass
+            else:
+                logger.debug(f"[{EXTENSION_VERSION}] Response: {response.status_code} | Endpoint: {endpoint}")
+        else:
+            logger.error(f"[{EXTENSION_VERSION}] POST {endpoint} FAILED: {response.status_code}")
+            logger.error(f"[{EXTENSION_VERSION}] Error response: {response.text[:200]}")
+
         return _handle_response(response, raise_for_status)
+
+    def _get_auth_info(self):
+        """Get current authentication method info for logging"""
+        if self._using_oauth:
+            expires_in = int(self._oauth_expires_at - time.time()) if self._oauth_expires_at else 0
+            return f"OAuth (expires in {expires_in}s)"
+        elif "X-User-Auth-Token" in self._session.headers:
+            return "Legacy (X-User-Auth-Token)"
+        else:
+            return "None (UNAUTHENTICATED)"
 
     @property
     def membership(self):
@@ -116,6 +343,390 @@ class Client:
 
     def raise_for_secret(self):
         DownloadableTrack.from_id(self, "156914988", 5)
+
+    def set_oauth_tokens(self, access_token, refresh_token, expires_in=86400):
+        """
+        Set OAuth tokens for authentication (injected externally)
+
+        Args:
+            access_token: OAuth access token from Qobuz
+            refresh_token: OAuth refresh token for token renewal
+            expires_in: Token validity in seconds (default 24h)
+        """
+        logger.info("=" * 70)
+        logger.info(f"[{EXTENSION_VERSION}] Setting OAuth tokens for Qobuz authentication")
+        logger.info(f"[{EXTENSION_VERSION}] Access token: {access_token[:30]}...")
+        logger.info(f"[{EXTENSION_VERSION}] Refresh token: {refresh_token[:30] if refresh_token else 'None'}...")
+        logger.info(f"[{EXTENSION_VERSION}] Expires in: {expires_in} seconds ({expires_in/3600:.1f} hours)")
+
+        self._oauth_access_token = access_token
+        self._oauth_refresh_token = refresh_token
+        self._oauth_expires_at = time.time() + expires_in
+        self._using_oauth = True
+        self._logged_in = True  # Mark as logged in via OAuth
+
+        # Remove legacy auth header if present
+        if "X-User-Auth-Token" in self._session.headers:
+            logger.info(f"[{EXTENSION_VERSION}] Removing legacy X-User-Auth-Token header")
+            del self._session.headers["X-User-Auth-Token"]
+
+        # Set OAuth Bearer token
+        self._session.headers.update({
+            "Authorization": f"Bearer {access_token}"
+        })
+
+        # Log current headers (sanitized)
+        headers_log = {k: (v[:30] + "..." if k == "Authorization" else v)
+                      for k, v in self._session.headers.items()}
+        logger.info(f"[{EXTENSION_VERSION}] Session headers after OAuth setup: {headers_log}")
+
+        # Verify OAuth setup with test API call
+        logger.info(f"[{EXTENSION_VERSION}] Verifying OAuth authentication with test API call...")
+        try:
+            # Try to get user info to verify the token works
+            test_response = self.get("user/login", {}, raise_for_status=False)
+            if test_response.status_code == 200:
+                logger.info(f"[{EXTENSION_VERSION}] ✓ OAuth token verification SUCCESSFUL")
+                try:
+                    user_data = test_response.json()
+                    if "user" in user_data:
+                        logger.info(f"[{EXTENSION_VERSION}] User authenticated: {user_data.get('user', {}).get('login', 'Unknown')}")
+                        subscription = user_data.get("user", {}).get("credential", {}).get("parameters", {})
+                        if subscription:
+                            self._label = subscription.get("short_label", "Unknown")
+                            logger.info(f"[{EXTENSION_VERSION}] Qobuz subscription: {self._label}")
+                except Exception as e:
+                    logger.warning(f"[{EXTENSION_VERSION}] Could not parse user data: {e}")
+            else:
+                logger.warning(f"[{EXTENSION_VERSION}] ⚠ OAuth token verification returned status {test_response.status_code}")
+                logger.warning(f"[{EXTENSION_VERSION}] This may indicate an invalid or expired token")
+        except Exception as e:
+            logger.warning(f"[{EXTENSION_VERSION}] ⚠ OAuth verification test failed: {e}")
+            logger.warning(f"[{EXTENSION_VERSION}] Token may still work for other API calls")
+
+        logger.info(f"[{EXTENSION_VERSION}] ✓ OAuth authentication setup complete")
+        logger.info("=" * 70)
+
+    def _is_token_expired(self):
+        """Check if OAuth token is expired"""
+        if not self._using_oauth or self._oauth_expires_at is None:
+            return False
+        return time.time() >= self._oauth_expires_at
+
+    def _refresh_oauth_token(self):
+        """
+        Refresh OAuth access token using refresh token
+
+        Note: This requires the Qobuz OAuth token endpoint which may need
+        client_id and client_secret. In the proxy architecture, token refresh
+        should be handled by external system, not here. This is a placeholder.
+        """
+        if not self._oauth_refresh_token:
+            logger.error("Cannot refresh token: no refresh token available")
+            return False
+
+        logger.warning("OAuth token refresh not implemented - tokens should be refreshed by external system")
+        # In the proxy architecture, external system should refresh tokens and re-inject them
+        # via set_oauth_tokens() when they expire
+        return False
+
+    def report_streaming_start(self, track_id, format_id=6, user_id=None, date=None, online=True, local=False, intent="streaming", sample=False):
+        """
+        Fire-and-forget - Report streaming start to Qobuz API in background thread.
+        Returns immediately without blocking.
+
+        Args:
+            track_id: The track ID being played
+            format_id: Audio format/quality ID (default: 6 = CD quality)
+            user_id: Optional user ID for OAuth (if available)
+            date: Unix timestamp of playback start (default: current time)
+            online: Whether this is online streaming (default: True)
+            local: Whether this is local playback (default: False)
+
+        Returns:
+            None - Fire-and-forget, HTTP call happens in background
+        """
+        def _report_async():
+            try:
+                # Build complete parameter set as per Qobuz API requirements
+                current_time = int(time.time())
+                params = {
+                    "track_id": str(track_id),
+                    "format_id": str(format_id),
+                    "date": str(date if date is not None else current_time),
+                    "online": "true" if online else "false",
+                    "local": "true" if local else "false",
+                    "intent": intent,
+                    "sample": "true" if sample else "false"
+                }
+                if user_id:
+                    params["user_id"] = str(user_id)
+
+                logger.info("=" * 70)
+                logger.info(f"[{EXTENSION_VERSION}] reportStreamingStart (async)")
+                logger.info(f"[{EXTENSION_VERSION}]   - track_id: {track_id}")
+                logger.info(f"[{EXTENSION_VERSION}]   - format_id: {format_id}")
+                logger.info(f"[{EXTENSION_VERSION}]   - date: {params['date']}")
+                logger.info(f"[{EXTENSION_VERSION}]   - online: {params['online']}")
+                logger.info(f"[{EXTENSION_VERSION}]   - local: {params['local']}")
+                logger.info(f"[{EXTENSION_VERSION}]   - intent: {intent}")
+                logger.info(f"[{EXTENSION_VERSION}]   - sample: {sample}")
+                logger.info(f"[{EXTENSION_VERSION}]   - user_id: {user_id or 'N/A'}")
+                logger.info(f"[{EXTENSION_VERSION}]   - full payload: {params}")
+
+                response = self.post("track/reportStreamingStart", params, raise_for_status=False)
+
+                # HTTP 200 and 201 are both success
+                if response.status_code in [200, 201]:
+                    logger.info(f"[{EXTENSION_VERSION}] ✓ Streaming start reported (HTTP {response.status_code})")
+                    try:
+                        response_data = response.json()
+                        logger.debug(f"[{EXTENSION_VERSION}] Response data: {response_data}")
+                    except:
+                        pass
+                else:
+                    logger.warning(f"[{EXTENSION_VERSION}] ✗ Streaming start FAILED with status {response.status_code}")
+                    logger.warning(f"[{EXTENSION_VERSION}] Error response: {response.text[:200]}")
+
+                logger.info("=" * 70)
+
+            except Exception as e:
+                logger.warning(f"[{EXTENSION_VERSION}] Background reporting failed: {e}")
+                import traceback
+                logger.debug(f"[{EXTENSION_VERSION}] Traceback: {traceback.format_exc()}")
+
+        # Submit to thread pool and return immediately (fire-and-forget)
+        self._http_executor.submit(_report_async)
+        logger.debug(f"[{EXTENSION_VERSION}] Queued reportStreamingStart for track {track_id}")
+
+    def _generate_request_signature(self, endpoint, params):
+        """
+        Generate request signature for signed Qobuz API endpoints.
+
+        Args:
+            endpoint: API endpoint (e.g., "track/reportStreamingEndJson")
+            params: Dictionary of request parameters
+
+        Returns:
+            Tuple of (request_ts, request_sig)
+        """
+        unix = int(time.time())
+
+        # Build signature string: endpoint + sorted params + timestamp + secret
+        # Sort parameters alphabetically as per Qobuz API requirements
+        sorted_params = sorted(params.items())
+        param_string = "".join(f"{k}{v}" for k, v in sorted_params)
+
+        sig_string = f"{endpoint}{param_string}{unix}{self.secret}"
+        sig_hashed = hashlib.md5(sig_string.encode("utf-8")).hexdigest()
+
+        return unix, sig_hashed
+
+    def report_streaming_end_json(self, track_id, duration=None, user_id=None, format_id=6,
+                                  date=None, online=True, local=False, track_context_uuid=None,
+                                  blob=None):
+        """
+        Fire-and-forget - Report streaming end to Qobuz API using modern JSON endpoint.
+        Returns immediately without blocking.
+
+        This is the modern replacement for the deprecated reportStreamingEnd endpoint.
+        Uses JSON body format with ISO 8601 timestamps and proper request signing.
+
+        Args:
+            track_id: The track ID that finished playing
+            duration: Playback duration in seconds (optional but recommended)
+            user_id: Optional user ID for OAuth (if available)
+            format_id: Audio format/quality ID (default: 6 = CD quality)
+            date: Unix timestamp of playback start (default: current time)
+            online: Whether this was online streaming (default: True)
+            local: Whether this was local playback (default: False)
+            track_context_uuid: Optional tracking UUID from Qobuz
+            blob: The blob from track/getFileUrl response (required by Qobuz)
+
+        Returns:
+            None - Fire-and-forget, HTTP call happens in background
+        """
+        def _report_async():
+            try:
+                import uuid
+
+                # Get current time for timestamp
+                current_time = int(time.time())
+                start_timestamp = date if date is not None else current_time
+
+                # Convert Unix timestamp to ISO 8601 format with timezone (UTC)
+                start_datetime = datetime.datetime.fromtimestamp(start_timestamp, tz=datetime.timezone.utc)
+                # Format as ISO 8601 with timezone: YYYY-MM-DDTHH:MM:SS+00:00
+                start_iso = start_datetime.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+                # Build JSON body as per Qobuz API docs
+                json_body = {
+                    "renderer_context": {
+                        "software_version": "Mopidy-Qobuz"
+                    },
+                    "events": [{
+                        "duration": int(duration) if duration is not None else 0,
+                        "start_stream": start_iso,
+                        "blob": blob or "",  # Use provided blob or empty string
+                        "track_context_uuid": track_context_uuid or str(uuid.uuid4()),
+                        "online": online,
+                        "local": local
+                    }]
+                }
+
+                # Generate request signature for the endpoint
+                endpoint = "track/reportStreamingEndJson"
+                params = {
+                    "track_id": str(track_id),
+                    "format_id": str(format_id)
+                }
+                if user_id:
+                    params["user_id"] = str(user_id)
+
+                request_ts, request_sig = self._generate_request_signature(endpoint, params)
+                params["request_ts"] = request_ts
+                params["request_sig"] = request_sig
+
+                logger.info("=" * 70)
+                logger.info(f"[{EXTENSION_VERSION}] reportStreamingEndJson (async - MODERN JSON)")
+                logger.info(f"[{EXTENSION_VERSION}]   - track_id: {track_id}")
+                logger.info(f"[{EXTENSION_VERSION}]   - duration: {duration:.1f}s" if duration else f"[{EXTENSION_VERSION}]   - duration: 0s")
+                logger.info(f"[{EXTENSION_VERSION}]   - format_id: {format_id}")
+                logger.info(f"[{EXTENSION_VERSION}]   - start_stream: {start_iso}")
+                logger.info(f"[{EXTENSION_VERSION}]   - online: {online}")
+                logger.info(f"[{EXTENSION_VERSION}]   - local: {local}")
+                logger.info(f"[{EXTENSION_VERSION}]   - track_context_uuid: {json_body['events'][0]['track_context_uuid']}")
+
+                # Configurable full JSON payload logging
+                enable_payload_logging = self._config.get('enable_payload_logging', False) if self._config else False
+                if enable_payload_logging:
+                    logger.info(f"[{EXTENSION_VERSION}]   - FULL JSON PAYLOAD:")
+                    logger.info(f"[{EXTENSION_VERSION}] {json.dumps(json_body, indent=2)}")
+                else:
+                    logger.info(f"[{EXTENSION_VERSION}]   - JSON body: {json.dumps(json_body, indent=2)}")
+
+                # Make POST request with JSON content type
+                headers = {
+                    "Content-Type": "application/json"
+                }
+                url = f"{BASE_URL}/{endpoint}"
+
+                # Add signature to URL params
+                url_with_params = f"{url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+
+                logger.info(f"[{EXTENSION_VERSION}]   - Request URL: {url_with_params}")
+
+                response = self._session.post(
+                    url_with_params,
+                    json=json_body,
+                    headers=headers,
+                    timeout=5.0
+                )
+
+                # HTTP 200 and 201 are both success
+                if response.status_code in [200, 201]:
+                    logger.info(f"[{EXTENSION_VERSION}] ✓ Streaming end reported via JSON (HTTP {response.status_code})")
+                    try:
+                        response_data = response.json()
+                        logger.debug(f"[{EXTENSION_VERSION}] Response data: {response_data}")
+                    except:
+                        pass
+                else:
+                    logger.warning(f"[{EXTENSION_VERSION}] ✗ Streaming end JSON FAILED with status {response.status_code}")
+                    logger.warning(f"[{EXTENSION_VERSION}] Error response: {response.text[:200]}")
+
+                logger.info("=" * 70)
+
+            except Exception as e:
+                logger.warning(f"[{EXTENSION_VERSION}] Background JSON reporting failed: {e}")
+                import traceback
+                logger.debug(f"[{EXTENSION_VERSION}] Traceback: {traceback.format_exc()}")
+
+        # Submit to thread pool and return immediately (fire-and-forget)
+        self._http_executor.submit(_report_async)
+        logger.debug(f"[{EXTENSION_VERSION}] Queued reportStreamingEndJson for track {track_id}")
+
+    def report_streaming_end(self, track_id, duration=None, user_id=None, format_id=6, date=None, online=True, local=False):
+        """
+        Fire-and-forget - Report streaming end to Qobuz API in background thread.
+        Returns immediately without blocking.
+
+        NOTE: This uses the deprecated reportStreamingEnd endpoint.
+        Consider using report_streaming_end_json() for the modern JSON endpoint.
+
+        Args:
+            track_id: The track ID that finished playing
+            duration: Playback duration in seconds (optional but recommended)
+            user_id: Optional user ID for OAuth (if available)
+            format_id: Audio format/quality ID (default: 6 = CD quality)
+            date: Unix timestamp of playback end (default: current time)
+            online: Whether this was online streaming (default: True)
+            local: Whether this was local playback (default: False)
+
+        Returns:
+            None - Fire-and-forget, HTTP call happens in background
+        """
+        def _report_async():
+            try:
+                # Build complete parameter set as per Qobuz API requirements
+                current_time = int(time.time())
+                params = {
+                    "track_id": str(track_id),
+                    "format_id": str(format_id),
+                    "date": str(date if date is not None else current_time),
+                    "online": "true" if online else "false",
+                    "local": "true" if local else "false",
+                }
+                if duration is not None:
+                    params["duration"] = str(int(duration))
+                if user_id:
+                    params["user_id"] = str(user_id)
+
+                logger.info("=" * 70)
+                logger.info(f"[{EXTENSION_VERSION}] reportStreamingEnd (async - DEPRECATED)")
+                logger.info(f"[{EXTENSION_VERSION}]   - track_id: {track_id}")
+                logger.info(f"[{EXTENSION_VERSION}]   - duration: {duration:.1f}s" if duration else f"[{EXTENSION_VERSION}]   - duration: N/A")
+                logger.info(f"[{EXTENSION_VERSION}]   - format_id: {format_id}")
+                logger.info(f"[{EXTENSION_VERSION}]   - date: {params['date']}")
+                logger.info(f"[{EXTENSION_VERSION}]   - online: {params['online']}")
+                logger.info(f"[{EXTENSION_VERSION}]   - local: {params['local']}")
+                logger.info(f"[{EXTENSION_VERSION}]   - user_id: {user_id or 'N/A'}")
+                logger.info(f"[{EXTENSION_VERSION}]   - full payload: {params}")
+
+                response = self.post("track/reportStreamingEnd", params, raise_for_status=False)
+
+                # HTTP 200 and 201 are both success
+                if response.status_code in [200, 201]:
+                    logger.info(f"[{EXTENSION_VERSION}] ✓ Streaming end reported (HTTP {response.status_code})")
+                    try:
+                        response_data = response.json()
+                        logger.debug(f"[{EXTENSION_VERSION}] Response data: {response_data}")
+                    except:
+                        pass
+                else:
+                    logger.warning(f"[{EXTENSION_VERSION}] ✗ Streaming end FAILED with status {response.status_code}")
+                    logger.warning(f"[{EXTENSION_VERSION}] Error response: {response.text[:200]}")
+
+                logger.info("=" * 70)
+
+            except Exception as e:
+                logger.warning(f"[{EXTENSION_VERSION}] Background reporting failed: {e}")
+                import traceback
+                logger.debug(f"[{EXTENSION_VERSION}] Traceback: {traceback.format_exc()}")
+
+        # Submit to thread pool and return immediately (fire-and-forget)
+        self._http_executor.submit(_report_async)
+        logger.debug(f"[{EXTENSION_VERSION}] Queued reportStreamingEnd for track {track_id}")
+
+    def shutdown(self):
+        """
+        Shutdown executor gracefully.
+        Called when Mopidy backend is stopping.
+        """
+        if hasattr(self, '_http_executor'):
+            logger.info(f"[{EXTENSION_VERSION}] Shutting down HTTP thread pool executor...")
+            self._http_executor.shutdown(wait=False)
+            logger.info(f"[{EXTENSION_VERSION}] ✓ HTTP thread pool executor shut down")
 
 
 _exception_codes = {400: BadRequestError, 401: AuthenticationError, 404: NotFoundError}
@@ -148,6 +759,7 @@ class DownloadableTrack:
         self.bit_depth = data.get("bit_depth", 16)
         self.sampling_rate = data.get("sampling_rate", 44.1)
         self.restrictions = data.get("restrictions", [])
+        self.blob = data.get("blob", "")  # Blob from track/getFileUrl for reporting
 
         try:
             self.etsp = datetime.datetime.fromtimestamp(
@@ -174,7 +786,7 @@ class DownloadableTrack:
         """
         raises InvalidQuality, TrackUrlNotFoundError, InvalidAppSecretError
         """
-        unix = time.time()
+        unix = int(time.time())  # Must be integer for Qobuz API
 
         try:
             valid = int(format_id) in (5, 6, 7, 27)
@@ -184,8 +796,10 @@ class DownloadableTrack:
         if not valid:
             raise InvalidQuality("Invalid quality id: choose between 5, 6, 7 or 27")
 
-        r_sig = f"trackgetFileUrlformat_id{format_id}intentstreamtrack_id{id}{unix}{client.secret}"
+        # Build signature string as per Qobuz API docs (alphabetical parameter order)
+        r_sig = f"trackgetFileUrlformat_id{format_id}intent{intent}track_id{id}{unix}{client.secret}"
         r_sig_hashed = hashlib.md5(r_sig.encode("utf-8")).hexdigest()
+
         params = {
             "request_ts": unix,
             "request_sig": r_sig_hashed,
@@ -268,8 +882,14 @@ class _WithMetadata:
         return self._metadata
 
     @classmethod
-    def from_id(cls, client, id):
-        response = client.get(cls._endpoint, params={cls._param: id}).json()
+    def from_id(cls, client, id, **extra_params):
+        """
+        Fetch object by ID with optional extra parameters.
+        For Album: pass extra="tracks" to get embedded track list.
+        """
+        params = {cls._param: id}
+        params.update(extra_params)
+        response = client.get(cls._endpoint, params=params).json()
         return cls(client, response)
 
 
@@ -363,10 +983,42 @@ class Track(_WithMetadata):
         return f"qobuz:track:{self.id}"
 
     @classmethod
+    def from_id(cls, client, id):
+        """
+        Fetch track by ID with caching.
+        Cache stores Track objects for 8 hours, max 300 tracks.
+        """
+        # Check cache first
+        cache_key = str(id)
+        cached_track = track_cache.get(cache_key)
+        if cached_track is not None:
+            return cached_track
+
+        # Cache miss - fetch from API
+        response = client.get(cls._endpoint, params={cls._param: id}).json()
+        track = cls(client, response)
+
+        # Store in cache
+        track_cache.put(cache_key, track)
+
+        return track
+
+    @classmethod
     def from_search(cls, client, query, limit=10):
-        tracks = client.get("track/search", {"query": query, "limit": limit}).json()
+        """
+        Search for tracks and cache results to avoid redundant API calls.
+        When get_images() is called after search, it will use cached data.
+        """
+        tracks_data = client.get("track/search", {"query": query, "limit": limit}).json()
         try:
-            return [cls(client, item) for item in tracks["tracks"]["items"]]
+            tracks = []
+            for item in tracks_data["tracks"]["items"]:
+                track = cls(client, item)
+                # Cache track so get_images() doesn't need to fetch again
+                track_cache.put(str(track.id), track)
+                logger.debug(f"Cached track from search: {track.id}")
+                tracks.append(track)
+            return tracks
         except (IndexError, KeyError):
             return []
 
@@ -390,10 +1042,26 @@ class _WithImageMixin:
 
     def image(self, key="large"):
         """
+        Get image URL with caching.
+        Cache stores image URLs for 8 hours, max 300 URLs.
+
         :param key: small, thumbnail, or large
         """
+        # Create cache key from object ID and image size
+        cache_key = f"{self.id}:{key}"
+
+        # Check cache first
+        cached_url = artwork_cache.get(cache_key)
+        if cached_url is not None:
+            return cached_url
+
+        # Cache miss - get from image dict
         try:
-            return self._image[key]
+            url = self._image[key]
+            # Store in cache if found
+            if url:
+                artwork_cache.put(cache_key, url)
+            return url
         except (TypeError, KeyError):
             return None
 
@@ -442,12 +1110,46 @@ class Album(_WithMetadata, _WithImageMixin):
         return f"qobuz:album:{self.id}"
 
     @classmethod
+    def from_id(cls, client, id, **extra_params):
+        """
+        Fetch album by ID with caching.
+        Cache stores Album objects for 8 hours, max 300 albums.
+        """
+        # Check cache first
+        cache_key = str(id)
+        cached_album = album_cache.get(cache_key)
+        if cached_album is not None:
+            return cached_album
+
+        # Cache miss - fetch from API
+        params = {cls._param: id}
+        params.update(extra_params)
+        response = client.get(cls._endpoint, params=params).json()
+        album = cls(client, response)
+
+        # Store in cache
+        album_cache.put(cache_key, album)
+
+        return album
+
+    @classmethod
     def from_search(cls, client, query, limit=10):
-        albums = client.get(
+        """
+        Search for albums and cache results to avoid redundant API calls.
+        When get_images() is called after search, it will use cached data.
+        """
+        albums_data = client.get(
             "album/search", {"query": query, "limit": limit, "extra": "release_type"}
         ).json()
         try:
-            return [cls(client, item) for item in albums["albums"]["items"]]
+            albums = []
+            for item in albums_data["albums"]["items"]:
+                album = cls(client, item)
+                # Cache album so get_images() doesn't need to fetch again
+                album_cache.put(str(album.id), album)
+                logger.debug(f"Cached album from search: {album.id}")
+                albums.append(album)
+            return albums
         except (IndexError, KeyError):
             return []
 
@@ -470,8 +1172,18 @@ class Artist(_BigWithMetadata, _WithImageMixin):
         self.picture = data.get("picture")
         self.albums_count = data.get("albums_count")
         self.slug = data.get("slug")
+
+        # Artist images can come from either "image" or "picture" field
+        # Search results typically use "picture", full artist data uses "image"
         self._image = data.get("image")
-        self.picture = data.get("picture")
+        if self._image is None and self.picture is not None:
+            # Convert picture URL to image dict format for consistency
+            self._image = {
+                "small": self.picture,
+                "thumbnail": self.picture,
+                "large": self.picture
+            }
+
         self.similar_artist_ids = data.get("similar_artist_ids")
         self.information = data.get("information")
         self.biography = data.get("biography")
@@ -514,10 +1226,44 @@ class Artist(_BigWithMetadata, _WithImageMixin):
         return f"qobuz:artist:{self.id}"
 
     @classmethod
+    def from_id(cls, client, id, **extra_params):
+        """
+        Fetch artist by ID with caching.
+        Cache stores Artist objects for 8 hours, max 300 artists.
+        """
+        # Check cache first
+        cache_key = str(id)
+        cached_artist = artist_cache.get(cache_key)
+        if cached_artist is not None:
+            return cached_artist
+
+        # Cache miss - fetch from API
+        params = {cls._param: id}
+        params.update(extra_params)
+        response = client.get(cls._endpoint, params=params).json()
+        artist = cls(client, response)
+
+        # Store in cache
+        artist_cache.put(cache_key, artist)
+
+        return artist
+
+    @classmethod
     def from_search(cls, client, query, limit=10):
-        artists = client.get("artist/search", {"query": query, "limit": limit}).json()
+        """
+        Search for artists and cache results to avoid redundant API calls.
+        When get_images() is called after search, it will use cached data.
+        """
+        artists_data = client.get("artist/search", {"query": query, "limit": limit}).json()
         try:
-            return [cls(client, item) for item in artists["artists"]["items"]]
+            artists = []
+            for item in artists_data["artists"]["items"]:
+                artist = cls(client, item)
+                # Cache artist so get_images() doesn't need to fetch again
+                artist_cache.put(str(artist.id), artist)
+                logger.debug(f"Cached artist from search: {artist.id}")
+                artists.append(artist)
+            return artists
         except (IndexError, KeyError):
             return []
 

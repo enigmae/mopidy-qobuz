@@ -13,6 +13,7 @@ class QobuzPlaybackProvider(backend.PlaybackProvider):
     def __init__(self, audio, backend):
         super().__init__(audio, backend)
         self._format_id = self.backend._config["qobuz"]["quality"]
+        self._enable_reporting = self.backend._config["qobuz"].get("enable_playback_reporting", False)
         self._tracks = {}
 
     def translate_uri(self, uri):
