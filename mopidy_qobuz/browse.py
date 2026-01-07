@@ -160,7 +160,8 @@ def _browse_playlist(*, uri: str, client, config):
 
 def _browse_album(*, uri: str, client, config):
     album_id = uri.split(":")[-1]
-    album = Album.from_id(client, album_id)
+    # Request album with embedded tracks to avoid individual track/get calls
+    album = Album.from_id(client, album_id, extra="tracks")
     tracks = [translators.to_track_ref(track, False) for track in album.tracks]
     return _filter_none(tracks)
 

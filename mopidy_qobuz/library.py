@@ -54,7 +54,8 @@ class QobuzLibraryProvider(backend.LibraryProvider):
 
             # TODO: add artist and playlist support
             if type == "album":
-                album = Album.from_id(client, id)
+                # Request album with embedded tracks to avoid individual track/get calls
+                album = Album.from_id(client, id, extra="tracks")
                 tracks.extend([translators.to_track(track) for track in album.tracks])
 
             elif type == "artist":
@@ -106,12 +107,42 @@ class QobuzLibraryProvider(backend.LibraryProvider):
             )
             tracks = self._search(translators.to_track, Track, "search_track_count", query)
 
+            # Background fetch: Prefetch full artist data for better caching
+            # This populates the cache with complete artist info (including images)
+            # so clicking on an artist is instant
+            self._prefetch_artists(artists)
+
         return models.SearchResult(
             uri=uri,
             albums=albums,
             artists=artists,
             tracks=tracks,
         )
+
+    def _prefetch_artists(self, artists):
+        """
+        Background fetch full artist data to populate cache.
+        This makes artist pages load instantly when clicked.
+        """
+        if not artists:
+            return
+
+        client = self._backend._client
+
+        # Fetch artist data in background (non-blocking)
+        def fetch_artist_data():
+            for artist in artists[:10]:  # Limit to top 10 to avoid excessive calls
+                try:
+                    # Extract artist ID from URI (format: qobuz:artist:123456)
+                    artist_id = artist.uri.split(":")[-1]
+                    # Fetch full artist data - will populate cache
+                    Artist.from_id(client, artist_id)
+                    logger.debug(f"Prefetched artist data for: {artist.name}")
+                except Exception as e:
+                    logger.debug(f"Failed to prefetch artist {artist.name}: {e}")
+
+        # Use thread pool executor from client for background fetch
+        client._http_executor.submit(fetch_artist_data)
 
     def get_images(self, uris):
         logger.info("Looking for images: %s", uris)
@@ -125,16 +156,21 @@ class QobuzLibraryProvider(backend.LibraryProvider):
             type = uri.split(":")[1]
             id = uri.split(":")[-1]
 
-            if type not in ("album", "track"):
+            if type not in ("album", "track", "artist"):
                 continue
 
             image = None
             if type == "album":
+                # For image lookup, we don't need tracks
                 album = Album.from_id(client, id)
                 image = album.image()
             elif type == "track":
                 track = Track.from_id(client, id)
                 image = track.album.image()
+            elif type == "artist":
+                # Fetch artist and get image
+                artist = Artist.from_id(client, id)
+                image = artist.image()
 
             if image is not None:
                 images[uri] = [models.Image(uri=image, width=600, height=600)]
