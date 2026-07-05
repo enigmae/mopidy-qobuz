@@ -9,8 +9,11 @@ Only throttles the endpoints that violate the 2 calls/sec limit:
 - album/get
 - track/get
 - artist/get
+- playlist/getUserPlaylists (paged listing can burst several calls)
 
 Search endpoints are not throttled (already compliant).
+playlist/get is deliberately not throttled: it backs latency-sensitive
+per-playlist track paging.
 """
 
 import logging
@@ -48,7 +51,8 @@ class SimpleRateLimiter:
         self.throttled_endpoints = {
             'album/get',
             'track/get',
-            'artist/get'
+            'artist/get',
+            'playlist/getUserPlaylists'
         }
 
         logger.info(f"[RATE LIMITER] Initialized (max {max_calls} calls/{window}s)")

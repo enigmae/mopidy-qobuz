@@ -74,12 +74,22 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
                 snapshot[playlist.uri] = playlist
 
         # Replacing the snapshot implicitly prunes playlists that
-        # disappeared upstream
+        # disappeared upstream. Unchanged entries are the same objects as
+        # before, so dict equality doubles as an identity-based change check
+        changed = snapshot != self._snapshot
         self._snapshot = snapshot
         self._playlists.put(_LIST_KEY, True)
 
-        backend.BackendListener.send("playlists_loaded")
-        logger.info("Qobuz playlists refreshed (%d playlists)", len(snapshot))
+        if changed:
+            # Only notify clients when something actually changed;
+            # unconditional events make every TTL-triggered refresh fan out
+            # into a full re-fetch by every client
+            backend.BackendListener.send("playlists_loaded")
+        logger.info(
+            "Qobuz playlists refreshed (%d playlists, changed=%s)",
+            len(snapshot),
+            changed,
+        )
 
     def create(self, name):
         # Apparently possible with Qobuz API. TODO.
@@ -104,9 +114,18 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         if uri is None or not uri.startswith("qobuz:playlist"):
             return None
 
-        # refresh() only replaces entries whose upstream updated_at is
-        # newer than the cached copy, so cached tracks stay valid here
-        playlist = self._list_snapshot().get(uri) or self._playlists.get(uri)
+        # Check the snapshot and the per-URI cache BEFORE the list
+        # freshness check, so a single-playlist lookup never blocks on (or
+        # fails with) a full user-list refresh after TTL expiry. Serving a
+        # slightly-stale user playlist is fine: track staleness is governed
+        # by the updated_at reconciliation in refresh()
+        playlist = self._snapshot.get(uri) or self._playlists.get(uri)
+        if playlist is not None:
+            return playlist
+
+        # Unknown URI: refresh the user list if stale (catches playlists
+        # created upstream since the last refresh) and re-check
+        playlist = self._list_snapshot().get(uri)
         if playlist is not None:
             return playlist
 
@@ -118,9 +137,17 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
 
 
 def _is_newer(upstream, cached):
-    """True when the upstream copy is newer than the cached one"""
-    if upstream.updated_at is None or cached.updated_at is None:
-        # Can't compare timestamps: assume the upstream copy changed
-        return True
+    """True when the upstream copy is newer than the cached one.
 
-    return upstream.updated_at > cached.updated_at
+    Compares updated_at timestamps when both sides have one. The real API
+    may omit updated_at; in that case fall back to detectable-change
+    heuristics (name, track count) so unchanged playlists keep their
+    cached copy -- and already-loaded tracks -- across refreshes.
+    """
+    if upstream.updated_at is not None and cached.updated_at is not None:
+        return upstream.updated_at > cached.updated_at
+
+    return (
+        upstream.name != cached.name
+        or upstream.tracks_count != cached.tracks_count
+    )

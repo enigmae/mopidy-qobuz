@@ -1402,10 +1402,10 @@ class User:
                 "playlist/getUserPlaylists", {"limit": limit, "offset": offset}
             ).json()
 
-            try:
-                items = response["playlists"]["items"]
-            except (KeyError, TypeError):
-                break
+            # Index strictly: a malformed page must raise (KeyError or
+            # TypeError) instead of silently ending the loop, which would
+            # make callers prune every playlist after the last good page
+            items = response["playlists"]["items"]
 
             playlists.extend(Playlist(self._client, data) for data in items)
 
