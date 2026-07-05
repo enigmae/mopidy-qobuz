@@ -94,7 +94,14 @@ def to_playlist(playlist):
     tracks = [to_track(track) for track in playlist.tracks]
     # See to_track()
     tracks = [track for track in tracks if track is not None]
-    return models.Playlist(uri=playlist.uri, name=playlist.name, tracks=tracks)
+    # Mopidy expects last_modified in milliseconds; Qobuz reports epoch seconds
+    updated_at = playlist.updated_at
+    return models.Playlist(
+        uri=playlist.uri,
+        name=playlist.name,
+        tracks=tracks,
+        last_modified=updated_at * 1000 if updated_at else None,
+    )
 
 
 def _watermark_hires(is_hires_streamable, title):

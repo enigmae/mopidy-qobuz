@@ -1287,6 +1287,9 @@ class Playlist(_BigWithMetadata):
         self.name = data.get("name", "Unknown")
         self.tracks_count = data.get("tracks_count")
         self.duration = data.get("duration")
+        # Epoch seconds from the Qobuz API; may be absent
+        self.created_at = data.get("created_at")
+        self.updated_at = data.get("updated_at")
         self._tracks = None
         self._deleted = False
 
@@ -1389,15 +1392,30 @@ class User:
         self._client = client
 
     def get_playlists(self, limit=10):
-        response = self._client.get(
-            "playlist/getUserPlaylists", {"limit": limit}
-        ).json()
-        try:
-            return [
-                Playlist(self._client, data) for data in response["playlists"]["items"]
-            ]
-        except (KeyError, TypeError):
-            return []
+        # Page through the results so users with more playlists than a
+        # single page still get the full list
+        playlists = []
+        offset = 0
+
+        while True:
+            response = self._client.get(
+                "playlist/getUserPlaylists", {"limit": limit, "offset": offset}
+            ).json()
+
+            try:
+                items = response["playlists"]["items"]
+            except (KeyError, TypeError):
+                break
+
+            playlists.extend(Playlist(self._client, data) for data in items)
+
+            # A short page means we reached the end
+            if not items or len(items) < limit:
+                break
+
+            offset += limit
+
+        return playlists
 
     def get_favorites(self, type="albums", offset=0, limit=10):
         # TODO: serialize more types
