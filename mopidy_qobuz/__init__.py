@@ -55,6 +55,7 @@ class Extension(ext.Extension):
         # Playlist settings
         schema["playlist_track_limit"] = config.Integer(optional=True)
         schema["playlist_cache_ttl"] = config.Integer(optional=True)
+        schema["playlist_cache_refresh_secs"] = config.Integer(optional=True)
 
         # Playback reporting
         schema["enable_playback_reporting"] = config.Boolean(optional=True)

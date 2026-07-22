@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
+import threading
+import time
 
 from mopidy import backend
 
@@ -22,6 +24,31 @@ DEFAULT_CACHE_TTL = 300
 _LIST_KEY = "__user_playlists__"
 
 
+class PeriodicThread(threading.Thread):
+    """Minimal stdlib-only periodic-task thread.
+
+    Runs `target` every `period` seconds until `stop()` is called. Uses a
+    single Event.wait() per cycle (interruptible sleep) so stop() takes
+    effect within one `period` at most.
+    """
+
+    def __init__(self, target, period, name=None, daemon=True):
+        super().__init__(name=name, daemon=daemon)
+        self._target = target
+        self._period = period
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.wait(self._period):
+            try:
+                self._target()
+            except Exception:
+                logger.exception("PeriodicThread target raised an exception")
+
+    def stop(self):
+        self._stop_event.set()
+
+
 class QobuzPlaylistsProvider(backend.PlaylistsProvider):
     def __init__(self, backend):
         self._backend = backend
@@ -34,6 +61,68 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         # holds non-user playlists fetched via from_id (featured, shared)
         self._snapshot = {}
         self._playlists = LRUCache(max_size=300, ttl=ttl, name="Playlist")
+        self._refresh_thread = None
+
+    def start_periodic_refresh(self):
+        """Kick off an eager initial load, then start the periodic refresh thread.
+
+        Called by backend on_start (only once authenticated). The eager load
+        runs in its own thread so it never blocks on_start()/backend startup --
+        playlists just show up warm by the time the app asks for them instead
+        of on-demand on first access.
+        """
+        threading.Thread(
+            target=self._eager_initial_refresh,
+            name="qobuz-playlist-initial-refresh",
+            daemon=True,
+        ).start()
+
+        refresh_secs = self._backend._config["qobuz"].get("playlist_cache_refresh_secs")
+        if not refresh_secs or refresh_secs <= 0:
+            logger.info("Playlist periodic refresh disabled (playlist_cache_refresh_secs not set or <= 0)")
+            return
+
+        self._refresh_thread = PeriodicThread(
+            target=self._periodic_refresh,
+            period=refresh_secs,
+            name="qobuz-playlist-refresh",
+            daemon=True,
+        )
+        self._refresh_thread.start()
+        logger.info("Started playlist periodic refresh thread (every %s seconds)", refresh_secs)
+
+    def stop_periodic_refresh(self):
+        """Stop the periodic refresh thread. Called by backend on_stop."""
+        if self._refresh_thread:
+            logger.info("Stopping playlist periodic refresh thread...")
+            self._refresh_thread.stop()
+            self._refresh_thread.join(timeout=5)
+            if self._refresh_thread.is_alive():
+                logger.warning("Playlist refresh thread did not stop cleanly")
+            else:
+                logger.info("Playlist periodic refresh thread stopped")
+            self._refresh_thread = None
+
+    def _eager_initial_refresh(self):
+        """One-shot warm-up load, run once right after startup."""
+        try:
+            _start = time.time()
+            logger.info("[SYNC_TIMING] qobuz eager initial playlist load begin t=%s", _start)
+            self.refresh()
+            logger.info(
+                "[SYNC_TIMING] qobuz eager initial playlist load complete duration=%.2fs",
+                time.time() - _start,
+            )
+        except Exception:
+            logger.exception("Error during eager initial playlist load")
+
+    def _periodic_refresh(self):
+        try:
+            logger.debug("Periodic Qobuz playlist refresh starting...")
+            self.refresh()
+            logger.debug("Periodic Qobuz playlist refresh complete")
+        except Exception:
+            logger.exception("Error in periodic Qobuz playlist refresh")
 
     def as_list(self):
         return [
@@ -57,10 +146,22 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         return playlist
 
     def refresh(self):
+        _sync_timing_start = time.time()
+        was_cold = not self._snapshot
+        logger.info(
+            "[SYNC_TIMING] qobuz refresh begin t=%s was_cold=%s",
+            _sync_timing_start,
+            was_cold,
+        )
         logger.info("Refreshing Qobuz playlists")
 
         user = User(self._backend._client)
         playlists = user.get_playlists(limit=PLAYLIST_PAGE_SIZE)
+        logger.info(
+            "[SYNC_TIMING] qobuz get_playlists duration=%.2fs count=%d",
+            time.time() - _sync_timing_start,
+            len(playlists),
+        )
 
         snapshot = {}
 
@@ -89,6 +190,12 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
             "Qobuz playlists refreshed (%d playlists, changed=%s)",
             len(snapshot),
             changed,
+        )
+        logger.info(
+            "[SYNC_TIMING] qobuz refresh complete duration=%.2fs was_cold=%s count=%d",
+            time.time() - _sync_timing_start,
+            was_cold,
+            len(snapshot),
         )
 
     def create(self, name):

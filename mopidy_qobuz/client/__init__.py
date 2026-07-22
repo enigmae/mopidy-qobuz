@@ -382,9 +382,16 @@ class Client:
 
         # Verify OAuth setup with test API call
         logger.info(f"[{EXTENSION_VERSION}] Verifying OAuth authentication with test API call...")
+        _sync_timing_verify_start = time.time()
+        logger.info("[SYNC_TIMING] qobuz oauth verify begin t=%s", _sync_timing_verify_start)
         try:
             # Try to get user info to verify the token works
             test_response = self.get("user/login", {}, raise_for_status=False)
+            logger.info(
+                "[SYNC_TIMING] qobuz oauth verify complete duration=%.2fs status=%s",
+                time.time() - _sync_timing_verify_start,
+                test_response.status_code,
+            )
             if test_response.status_code == 200:
                 logger.info(f"[{EXTENSION_VERSION}] ✓ OAuth token verification SUCCESSFUL")
                 try:
