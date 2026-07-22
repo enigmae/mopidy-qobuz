@@ -382,9 +382,16 @@ class Client:
 
         # Verify OAuth setup with test API call
         logger.info(f"[{EXTENSION_VERSION}] Verifying OAuth authentication with test API call...")
+        _sync_timing_verify_start = time.time()
+        logger.info("[SYNC_TIMING] qobuz oauth verify begin t=%s", _sync_timing_verify_start)
         try:
             # Try to get user info to verify the token works
             test_response = self.get("user/login", {}, raise_for_status=False)
+            logger.info(
+                "[SYNC_TIMING] qobuz oauth verify complete duration=%.2fs status=%s",
+                time.time() - _sync_timing_verify_start,
+                test_response.status_code,
+            )
             if test_response.status_code == 200:
                 logger.info(f"[{EXTENSION_VERSION}] ✓ OAuth token verification SUCCESSFUL")
                 try:
@@ -1287,7 +1294,19 @@ class Playlist(_BigWithMetadata):
         self.name = data.get("name", "Unknown")
         self.tracks_count = data.get("tracks_count")
         self.duration = data.get("duration")
+        # Epoch seconds from the Qobuz API; may be absent
+        self.created_at = data.get("created_at")
+        self.updated_at = data.get("updated_at")
+        # Ready-made cover mosaics from the API: lists of album cover
+        # URLs derived from the playlist content, in ascending square
+        # sizes (~50px, 150px, 300px) plus a rectangular banner. All of
+        # them may be absent depending on the endpoint
+        self.images = data.get("images") or []
+        self.images150 = data.get("images150") or []
+        self.images300 = data.get("images300") or []
+        self.image_rectangle = data.get("image_rectangle") or []
         self._tracks = None
+        self._first_tracks_page = None
         self._deleted = False
 
     @classmethod
@@ -1331,6 +1350,42 @@ class Playlist(_BigWithMetadata):
 
         return self._tracks
 
+    def first_tracks_page(self, limit=50):
+        """First page of the playlist's tracks, fetched at most once.
+
+        Lightweight alternative to `tracks` for callers that only need
+        a sample of the content (e.g. artwork derivation): already
+        loaded tracks are reused, otherwise a single playlist/get call
+        fetches one page instead of paging through the whole playlist.
+        The page is pinned to this object; the playlists provider
+        replaces the object when upstream updated_at changes, so the
+        page follows content edits without its own invalidation.
+        """
+        if self._tracks is not None:
+            return self._tracks[:limit]
+
+        if self._first_tracks_page is None:
+            response = self._client.get(
+                self._endpoint,
+                {
+                    self._param: self.id,
+                    "extra": self._extra,
+                    "limit": limit,
+                    "offset": 0,
+                },
+            ).json()
+
+            try:
+                items = response["tracks"]["items"]
+            except (KeyError, TypeError):
+                items = []
+
+            self._first_tracks_page = [
+                Track(self._client, data) for data in items
+            ]
+
+        return self._first_tracks_page
+
     def subscribe(self):
         response = self._client.post(
             "playlist/subscribe", {"playlist_id": str(self.id)}
@@ -1356,6 +1411,7 @@ class Playlist(_BigWithMetadata):
 
     def refresh(self):
         self._tracks = None
+        self._first_tracks_page = None
 
     @property
     def uri(self):
@@ -1389,15 +1445,30 @@ class User:
         self._client = client
 
     def get_playlists(self, limit=10):
-        response = self._client.get(
-            "playlist/getUserPlaylists", {"limit": limit}
-        ).json()
-        try:
-            return [
-                Playlist(self._client, data) for data in response["playlists"]["items"]
-            ]
-        except (KeyError, TypeError):
-            return []
+        # Page through the results so users with more playlists than a
+        # single page still get the full list
+        playlists = []
+        offset = 0
+
+        while True:
+            response = self._client.get(
+                "playlist/getUserPlaylists", {"limit": limit, "offset": offset}
+            ).json()
+
+            # Index strictly: a malformed page must raise (KeyError or
+            # TypeError) instead of silently ending the loop, which would
+            # make callers prune every playlist after the last good page
+            items = response["playlists"]["items"]
+
+            playlists.extend(Playlist(self._client, data) for data in items)
+
+            # A short page means we reached the end
+            if not items or len(items) < limit:
+                break
+
+            offset += limit
+
+        return playlists
 
     def get_favorites(self, type="albums", offset=0, limit=10):
         # TODO: serialize more types

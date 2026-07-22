@@ -233,6 +233,8 @@ class QobuzBackend(pykka.ThreadingActor, backend.Backend):
 
     def on_start(self):
         from mopidy_qobuz import __version__
+        _sync_timing_on_start_begin = time.time()
+        logger.info("[SYNC_TIMING] qobuz on_start begin t=%s", _sync_timing_on_start_begin)
         logger.info("=" * 80)
         logger.info("[QOBUZ BACKEND] Starting Qobuz backend v%s with OAuth support", __version__)
         config = self._config["qobuz"]
@@ -346,6 +348,8 @@ class QobuzBackend(pykka.ThreadingActor, backend.Backend):
             logger.warning("[QOBUZ BACKEND] ⚠ No valid credentials - disabling Qobuz scheme")
             logger.warning("[QOBUZ BACKEND] Qobuz will not appear in available sources until authenticated")
             self.uri_schemes = []
+        else:
+            self.playlists.start_periodic_refresh()
 
         # Start playback reporter if enabled
         reporting_enabled = config.get('enable_playback_reporting', False)
@@ -373,9 +377,16 @@ class QobuzBackend(pykka.ThreadingActor, backend.Backend):
             logger.info("[QOBUZ BACKEND] Not using OAuth - token refresh not applicable")
 
         logger.info("[QOBUZ BACKEND] Backend initialization complete")
+        logger.info(
+            "[SYNC_TIMING] qobuz on_start complete duration=%.2fs",
+            time.time() - _sync_timing_on_start_begin,
+        )
         logger.info("=" * 80)
 
     def on_stop(self):
+        # Stop playlist periodic refresh thread
+        self.playlists.stop_periodic_refresh()
+
         # Stop token refresh thread
         self._stop_token_refresh_thread()
 

@@ -16,6 +16,18 @@ from mopidy_qobuz.client import Track
 
 logger = logging.getLogger(__name__)
 
+# Up to 4 distinct covers per playlist so clients can composite a 2x2
+# mosaic from the returned images
+PLAYLIST_MOSAIC_SIZE = 4
+
+# Qobuz playlist payloads carry ready-made cover mosaics in several
+# square sizes; prefer the largest variant that is populated
+_PLAYLIST_IMAGE_FIELDS = (
+    ("images300", 300),
+    ("images150", 150),
+    ("images", 50),
+)
+
 
 class QobuzLibraryProvider(backend.LibraryProvider):
     root_directory = ROOT_DIR
@@ -156,7 +168,13 @@ class QobuzLibraryProvider(backend.LibraryProvider):
             type = uri.split(":")[1]
             id = uri.split(":")[-1]
 
-            if type not in ("album", "track", "artist"):
+            if type not in ("album", "track", "artist", "playlist"):
+                continue
+
+            if type == "playlist":
+                # Playlists get multiple images (a content-derived
+                # mosaic) instead of the single image built below
+                images[uri] = self._get_playlist_images(uri)
                 continue
 
             image = None
@@ -180,6 +198,40 @@ class QobuzLibraryProvider(backend.LibraryProvider):
         logger.info("Returning images: %s", images)
         return images
 
+    def _get_playlist_images(self, uri):
+        """Return up to PLAYLIST_MOSAIC_SIZE images for a playlist URI.
+
+        Freshness: image results are NOT cached here. They are derived
+        on every call from the playlists provider's CURRENT snapshot
+        object; the provider's refresh() swaps snapshot entries whose
+        upstream updated_at changed (updated_at reconciliation), so
+        artwork follows playlist edits without a separate image cache
+        to key or invalidate. The only derived state
+        (Playlist._first_tracks_page) is pinned to the playlist object
+        itself and is discarded together with it on such a swap.
+        """
+        playlist = self._backend.playlists._get_playlist(uri)
+        if playlist is None:
+            return ()
+
+        # Prefer the service-provided mosaic from the list payload
+        for field, size in _PLAYLIST_IMAGE_FIELDS:
+            urls = _distinct_urls(getattr(playlist, field, None) or [])
+            if urls:
+                return [
+                    models.Image(uri=url, width=size, height=size)
+                    for url in urls
+                ]
+
+        # No service images: derive distinct album covers from the
+        # current tracks. Only the first tracks page is used (already
+        # loaded tracks are reused, otherwise it is fetched once per
+        # playlist object) so artwork never pages through a huge list
+        urls = _distinct_urls(
+            track.album.image() for track in playlist.first_tracks_page()
+        )
+        return [models.Image(uri=url, width=600, height=600) for url in urls]
+
     def _search(self, item_translator, item_cls, config_key, query):
         config_value = self._config[config_key]
 
@@ -196,3 +248,15 @@ class QobuzLibraryProvider(backend.LibraryProvider):
 def _filter_none(items):
     # Translator return None if something fails
     return [item for item in items if item is not None]
+
+
+def _distinct_urls(urls, limit=PLAYLIST_MOSAIC_SIZE):
+    # First `limit` distinct non-empty URLs, original order preserved
+    distinct = []
+    for url in urls:
+        if url and url not in distinct:
+            distinct.append(url)
+            if len(distinct) == limit:
+                break
+
+    return distinct
