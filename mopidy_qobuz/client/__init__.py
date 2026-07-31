@@ -951,6 +951,11 @@ class Track(_WithMetadata):
     def __init__(self, client: Client, data: dict, album=None, artist=None):
         super().__init__(client, data)
 
+        # Keep the raw API item so a fully-loaded playlist's tracks can be
+        # serialized to the on-disk tracks cache and reconstructed verbatim
+        # via Track(client, raw) after a restart. See PlaylistTracksDiskCache.
+        self._raw = data
+
         # Ignored keys (for now): release_date_download, release_date_stream,
         # purchasable, purchasable_at previewable, sampleable, articles, performers
 

@@ -5,8 +5,11 @@ import time
 
 from mopidy import backend
 
+from mopidy_qobuz import Extension
 from mopidy_qobuz.cache import LRUCache
+from mopidy_qobuz.cache import PlaylistTracksDiskCache
 from mopidy_qobuz.client import Playlist
+from mopidy_qobuz.client import Track
 from mopidy_qobuz.client import User
 from mopidy_qobuz.translators import to_playlist
 from mopidy_qobuz.translators import to_playlist_ref
@@ -17,11 +20,30 @@ logger = logging.getLogger(__name__)
 # Page size used when paging through playlist/getUserPlaylists
 PLAYLIST_PAGE_SIZE = 100
 
+# Tracks returned immediately on the first open of a not-yet-loaded playlist.
+# The remainder is paged in by a background backfill thread, so a large
+# playlist's first screen paints after ONE playlist/get page instead of
+# blocking on ceil(tracks_count / 500) sequential pages.
+FIRST_SLICE_SIZE = 50
+
+# On a cold start (empty disk cache), warm the first page of this many
+# playlists so opening one feels instant -- matches mopidy-tidal's eager
+# prefetch. Cheap: one playlist/get page each. Playlists already hydrated
+# from disk are skipped.
+EAGER_PREFETCH_COUNT = 5
+
 # Fallback when playlist_cache_ttl is not configured (see ext.conf)
 DEFAULT_CACHE_TTL = 300
 
 # Cache key holding the full user playlist snapshot ({uri: Playlist})
 _LIST_KEY = "__user_playlists__"
+
+# Pause between playlists during the throttled full-catalog track+artwork
+# prefetch pass -- mirrors mopidy-tidal's equivalent constant. Forcing
+# Playlist.tracks to resolve pages through the whole playlist regardless
+# of size, so for a library of 50-100 playlists this pass deliberately
+# paces itself rather than firing everything back-to-back.
+EAGER_FULL_CATALOG_PREFETCH_DELAY_SECS = 0.75
 
 
 class PeriodicThread(threading.Thread):
@@ -62,6 +84,18 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         self._snapshot = {}
         self._playlists = LRUCache(max_size=300, ttl=ttl, name="Playlist")
         self._refresh_thread = None
+        # Disk-persisted per-playlist track lists (keyed by uri + updated_at)
+        # that survive a Mopidy restart, so opening a previously-loaded
+        # playlist after the process restarts (e.g. when a credential is
+        # added) does NOT re-page every track from Qobuz. Written when a full
+        # backfill completes; hydrated back into playlist objects in refresh().
+        self._tracks_disk = PlaylistTracksDiskCache(
+            Extension.get_cache_dir(backend._config)
+        )
+        # URIs whose remaining tracks are being backfilled, so a second open
+        # doesn't spawn a duplicate backfill thread.
+        self._backfilling = set()
+        self._backfill_lock = threading.Lock()
 
     def start_periodic_refresh(self):
         """Kick off an eager initial load, then start the periodic refresh thread.
@@ -104,7 +138,15 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
             self._refresh_thread = None
 
     def _eager_initial_refresh(self):
-        """One-shot warm-up load, run once right after startup."""
+        """One-shot warm-up load, run once right after startup.
+
+        `refresh()` populates the playlist list, but Qobuz `Playlist`
+        objects load their tracks lazily -- nothing here has actually
+        fetched a single track yet. Kick off a throttled background pass
+        that forces every playlist's tracks (and artwork) to resolve, so
+        the whole library is warm on disk and opening any playlist is
+        instant instead of triggering an on-demand fetch on first touch.
+        """
         try:
             _start = time.time()
             logger.info("[SYNC_TIMING] qobuz eager initial playlist load begin t=%s", _start)
@@ -115,6 +157,61 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
             )
         except Exception:
             logger.exception("Error during eager initial playlist load")
+            return
+
+        # The full-catalog track+artwork prefetch storm is intentionally NOT
+        # started. It forced every playlist's full tracks on every boot
+        # (hundreds/thousands of calls over minutes -- the "stuck after adding
+        # Tidal"). It is superseded by (a) the on-disk track cache hydrated in
+        # refresh(), so unchanged playlists come back warm across restarts for
+        # free, and (b) first-slice-on-open + background backfill, which makes a
+        # cold open fast without pre-warming the whole library.
+        # (_throttled_full_catalog_prefetch is kept for reference / opt-in.)
+
+        # Warm the first page of the first few playlists so opening one feels
+        # instant on a cold start (empty disk cache). Cheap -- one playlist/get
+        # page each; the full track list still backfills lazily on actual open.
+        try:
+            _pf = time.time()
+            warmed = 0
+            for uri in list(self._snapshot.keys())[:EAGER_PREFETCH_COUNT]:
+                pl = self._snapshot.get(uri)
+                if pl is not None and pl._tracks is None:
+                    pl.first_tracks_page(FIRST_SLICE_SIZE)
+                    warmed += 1
+            logger.info(
+                "[SYNC_TIMING] qobuz eager first-page prefetch complete "
+                "duration=%.2fs warmed=%d",
+                time.time() - _pf,
+                warmed,
+            )
+        except Exception:
+            logger.exception("Error during qobuz eager first-page prefetch")
+
+    def _throttled_full_catalog_prefetch(self):
+        """Background pass: force every playlist's tracks + artwork to
+        resolve, one playlist at a time with a pause between each (see
+        EAGER_FULL_CATALOG_PREFETCH_DELAY_SECS) so this can't dominate the
+        connection or trip rate limiting during startup."""
+        uris = list(self._snapshot.keys())
+        _start = time.time()
+        logger.info(
+            "[SYNC_TIMING] qobuz full-catalog prefetch begin count=%d", len(uris)
+        )
+        for uri in uris:
+            try:
+                playlist = self._snapshot.get(uri)
+                if playlist is not None:
+                    _ = playlist.tracks  # force the lazy property to resolve
+                self._backend.library.get_images([uri])
+            except Exception:
+                logger.exception("Error during full-catalog prefetch for %s", uri)
+            time.sleep(EAGER_FULL_CATALOG_PREFETCH_DELAY_SECS)
+        logger.info(
+            "[SYNC_TIMING] qobuz full-catalog prefetch complete duration=%.2fs count=%d",
+            time.time() - _start,
+            len(uris),
+        )
 
     def _periodic_refresh(self):
         try:
@@ -131,19 +228,108 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
 
     def get_items(self, uri):
         playlist = self._get_playlist(uri)
-
-        if playlist is not None:
-            return [to_track_ref(track, False) for track in playlist.tracks]
-
-        return playlist
+        if playlist is None:
+            return None
+        tracks, _partial = self._tracks_for_open(playlist)
+        return [to_track_ref(track, False) for track in tracks]
 
     def lookup(self, uri):
         playlist = self._get_playlist(uri)
+        if playlist is None:
+            return None
+        tracks, partial = self._tracks_for_open(playlist)
+        return to_playlist(playlist, tracks=tracks, partial=partial)
 
-        if playlist is not None:
-            return to_playlist(playlist)
+    def _tracks_for_open(self, playlist):
+        """Return (tracks_to_expose_now, is_partial).
 
-        return playlist
+        Fast path: a fully-loaded playlist (in memory, or hydrated from the
+        on-disk cache in refresh()) returns its complete track list. Cold
+        path: return only the first page immediately and spawn a background
+        thread to page in the rest, so a big playlist's first screen paints
+        after one API call instead of ceil(tracks_count / 500) blocking calls.
+        """
+        if playlist._tracks is not None:
+            return playlist._tracks, False
+
+        first = playlist.first_tracks_page(FIRST_SLICE_SIZE)
+        total = playlist.tracks_count
+        if total is None or total > len(first):
+            # More tracks upstream (or count unknown): serve the slice now and
+            # fill in the rest in the background.
+            self._schedule_backfill(playlist)
+            return first, True
+        # The first page already is the whole playlist: pin it as the full
+        # track list and persist it so it comes back warm after a restart
+        # (no re-fetch), same as a backfilled big playlist.
+        playlist._tracks = list(first)
+        self._tracks_disk.put(
+            playlist.uri, playlist.updated_at, [track._raw for track in first]
+        )
+        return first, False
+
+    def _schedule_backfill(self, playlist):
+        uri = playlist.uri
+        with self._backfill_lock:
+            if uri in self._backfilling:
+                return
+            self._backfilling.add(uri)
+        threading.Thread(
+            target=self._backfill,
+            args=(playlist,),
+            name="qobuz-playlist-backfill",
+            daemon=True,
+        ).start()
+
+    def _backfill(self, playlist):
+        """Page in the full track list, persist it to disk, and tell clients
+        the complete list is ready (they re-query / reopen to get it)."""
+        uri = playlist.uri
+        try:
+            _start = time.time()
+            tracks = playlist.tracks  # forces the full paged load
+            self._tracks_disk.put(
+                uri, playlist.updated_at, [track._raw for track in tracks]
+            )
+            logger.info(
+                "[SYNC_TIMING] qobuz backfill complete uri=%s tracks=%d duration=%.2fs",
+                uri,
+                len(tracks),
+                time.time() - _start,
+            )
+            # The only unconditional send in this provider: fires once per
+            # user-initiated open, not on every TTL refresh (refresh()'s event
+            # stays change-gated), so it can't fan out into a re-fetch storm.
+            backend.BackendListener.send("playlists_loaded")
+        except Exception:
+            logger.exception("Error backfilling tracks for %s", uri)
+        finally:
+            with self._backfill_lock:
+                self._backfilling.discard(uri)
+
+    def _hydrate_tracks_from_disk(self, playlist):
+        """Pre-load a fresh playlist object's tracks from the on-disk cache
+        when its upstream updated_at matches, so opening it after a restart is
+        instant instead of re-paging from Qobuz. Returns True if it hydrated."""
+        if playlist._tracks is not None or playlist.updated_at is None:
+            return False
+        cached = self._tracks_disk.get(playlist.uri, playlist.updated_at)
+        if not cached:
+            return False
+        try:
+            client = self._backend._client
+            playlist._tracks = [Track(client, raw) for raw in cached]
+            logger.info(
+                "[SYNC_TIMING] qobuz hydrated %d tracks from disk for %s",
+                len(cached), playlist.uri,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to hydrate tracks from disk for %s", playlist.uri
+            )
+            playlist._tracks = None
+            return False
 
     def refresh(self):
         _sync_timing_start = time.time()
@@ -164,6 +350,7 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         )
 
         snapshot = {}
+        hydrated = 0
 
         for playlist in playlists:
             cached = self._snapshot.get(playlist.uri)
@@ -172,6 +359,14 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
                 # loaded tracks are reused
                 snapshot[playlist.uri] = cached
             else:
+                # New or changed upstream (or the first refresh after a
+                # restart, when the in-memory snapshot is empty): hydrate the
+                # full track list from disk when the upstream updated_at still
+                # matches, so a previously-opened playlist opens instantly
+                # instead of re-paging. A changed updated_at won't match the
+                # disk key, so stale tracks are never served.
+                if self._hydrate_tracks_from_disk(playlist):
+                    hydrated += 1
                 snapshot[playlist.uri] = playlist
 
         # Replacing the snapshot implicitly prunes playlists that
@@ -179,7 +374,14 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         # before, so dict equality doubles as an identity-based change check
         changed = snapshot != self._snapshot
         self._snapshot = snapshot
+        # Keep the on-disk tracks cache from growing without bound as
+        # playlists come and go.
+        self._tracks_disk.prune(snapshot.keys())
         self._playlists.put(_LIST_KEY, True)
+        logger.info(
+            "[SYNC_TIMING] qobuz refresh hydrated %d/%d playlists from disk cache",
+            hydrated, len(playlists),
+        )
 
         if changed:
             # Only notify clients when something actually changed;

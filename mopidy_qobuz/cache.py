@@ -9,9 +9,11 @@ Implements size-limited caching for albums, tracks, artists, and artwork URLs.
 - Thread-safe operations
 """
 
+import json
 import logging
 import time
 from collections import OrderedDict
+from pathlib import Path
 from threading import Lock
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,120 @@ class LRUCache:
             f"evictions={stats['evictions']}, "
             f"hit_rate={stats['hit_rate']}"
         )
+
+
+class PlaylistArtworkDiskCache:
+    """Disk-persisted cache for derived playlist artwork, keyed by
+    playlist URI and invalidated by the playlist's own `updated_at`
+    timestamp -- unlike LRUCache above, this survives a Mopidy restart.
+
+    Without this, a playlist's artwork has to be re-derived on every
+    restart even when nothing changed upstream: when the API doesn't
+    provide a ready-made mosaic, deriving it means fetching a page of
+    tracks (see `QobuzLibraryProvider._get_playlist_images`). Values are
+    plain JSON-serializable dicts (`{"uri":..., "width":..., "height":...}`
+    per image), not `models.Image` objects -- the caller reconstructs
+    those on read.
+    """
+
+    def __init__(self, cache_dir):
+        self._path = Path(cache_dir) / "playlist_artwork.json"
+        self._lock = Lock()
+        self._data = self._load()
+
+    def _load(self):
+        try:
+            with open(self._path, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def _persist(self):
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(self._data, f)
+            tmp_path.replace(self._path)
+        except OSError:
+            logger.exception("Failed to persist playlist artwork cache to disk")
+
+    def get(self, uri, updated_at):
+        with self._lock:
+            entry = self._data.get(uri)
+        if entry is None or entry.get("updated_at") != updated_at:
+            return None
+        return entry.get("images")
+
+    def put(self, uri, updated_at, images):
+        with self._lock:
+            self._data[uri] = {"updated_at": updated_at, "images": images}
+            self._persist()
+
+
+class PlaylistTracksDiskCache:
+    """Disk-persisted cache of a playlist's fully-loaded track list, keyed
+    by playlist URI and invalidated by the playlist's own `updated_at`
+    timestamp -- like PlaylistArtworkDiskCache, it survives a Mopidy
+    restart.
+
+    Without this, every Mopidy restart (e.g. the whole process restarts
+    when a streaming credential is added) drops the in-memory track lists,
+    so opening any playlist re-pages the entire track list from Qobuz
+    again. Values are the RAW Qobuz track item dicts (plain JSON), NOT
+    Track objects -- the caller reconstructs `Track(client, raw)` on read.
+    Skips playlists whose `updated_at` is None (nothing reliable to
+    invalidate on), mirroring the artwork cache.
+    """
+
+    def __init__(self, cache_dir):
+        self._path = Path(cache_dir) / "playlist_tracks.json"
+        self._lock = Lock()
+        self._data = self._load()
+
+    def _load(self):
+        try:
+            with open(self._path, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def _persist(self):
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(self._data, f)
+            tmp_path.replace(self._path)
+        except OSError:
+            logger.exception("Failed to persist playlist tracks cache to disk")
+
+    def get(self, uri, updated_at):
+        if updated_at is None:
+            return None
+        with self._lock:
+            entry = self._data.get(uri)
+        if entry is None or entry.get("updated_at") != updated_at:
+            return None
+        return entry.get("tracks")
+
+    def put(self, uri, updated_at, tracks):
+        if updated_at is None:
+            return
+        with self._lock:
+            self._data[uri] = {"updated_at": updated_at, "tracks": tracks}
+            self._persist()
+
+    def prune(self, live_uris):
+        """Drop cached entries for playlists no longer in the snapshot so
+        the file doesn't grow unbounded as playlists come and go."""
+        live = set(live_uris)
+        with self._lock:
+            stale = [uri for uri in self._data if uri not in live]
+            for uri in stale:
+                del self._data[uri]
+            if stale:
+                self._persist()
 
 
 # Global cache instances
