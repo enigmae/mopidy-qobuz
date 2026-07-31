@@ -90,17 +90,29 @@ def to_playlist_ref(playlist):
     return models.Ref.playlist(uri=playlist.uri, name=playlist.name)
 
 
-def to_playlist(playlist):
-    tracks = [to_track(track) for track in playlist.tracks]
+def to_playlist(playlist, tracks=None, partial=False):
+    """Build the Mopidy playlist model.
+
+    `tracks` lets the caller supply an explicit track slice (the fast
+    first page) instead of forcing the full lazy `playlist.tracks` load.
+    When `partial` is True the slice is only the first page and the rest
+    is still backfilling, so `last_modified` is suppressed -- any client
+    that caches by `last_modified` must not pin a truncated list as if it
+    were complete; the full list arrives on reopen (or on a
+    `playlists_loaded` re-query) carrying the real timestamp.
+    """
+    source = playlist.tracks if tracks is None else tracks
+    mopidy_tracks = [to_track(track) for track in source]
     # See to_track()
-    tracks = [track for track in tracks if track is not None]
+    mopidy_tracks = [track for track in mopidy_tracks if track is not None]
     # Mopidy expects last_modified in milliseconds; Qobuz reports epoch seconds
     updated_at = playlist.updated_at
+    last_modified = None if partial else (updated_at * 1000 if updated_at else None)
     return models.Playlist(
         uri=playlist.uri,
         name=playlist.name,
-        tracks=tracks,
-        last_modified=updated_at * 1000 if updated_at else None,
+        tracks=mopidy_tracks,
+        last_modified=last_modified,
     )
 
 

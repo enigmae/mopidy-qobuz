@@ -6,9 +6,11 @@ import urllib.parse
 from mopidy import backend
 from mopidy import models
 
+from mopidy_qobuz import Extension
 from mopidy_qobuz import translators
 from mopidy_qobuz.browse import browse
 from mopidy_qobuz.browse import ROOT_DIR
+from mopidy_qobuz.cache import PlaylistArtworkDiskCache
 from mopidy_qobuz.client import Album
 from mopidy_qobuz.client import Artist
 from mopidy_qobuz.client import Playlist
@@ -35,6 +37,9 @@ class QobuzLibraryProvider(backend.LibraryProvider):
     def __init__(self, backend):
         self._backend = backend
         self._config = backend._config["qobuz"]
+        self._artwork_cache = PlaylistArtworkDiskCache(
+            Extension.get_cache_dir(backend._config)
+        )
 
     def get_distinct(self, field, query=None):
         logger.info("Browsing distinct %s with query %r", field, query)
@@ -201,19 +206,41 @@ class QobuzLibraryProvider(backend.LibraryProvider):
     def _get_playlist_images(self, uri):
         """Return up to PLAYLIST_MOSAIC_SIZE images for a playlist URI.
 
-        Freshness: image results are NOT cached here. They are derived
-        on every call from the playlists provider's CURRENT snapshot
-        object; the provider's refresh() swaps snapshot entries whose
-        upstream updated_at changed (updated_at reconciliation), so
-        artwork follows playlist edits without a separate image cache
-        to key or invalidate. The only derived state
-        (Playlist._first_tracks_page) is pinned to the playlist object
-        itself and is discarded together with it on such a swap.
+        Freshness: within a single process lifetime, results don't need
+        re-deriving on every call -- the provider's refresh() swaps
+        snapshot entries whose upstream updated_at changed, so artwork
+        follows playlist edits without any invalidation logic here. But
+        that in-memory reuse doesn't survive a restart, and deriving
+        artwork the API doesn't hand us a ready-made mosaic for means
+        fetching a page of tracks. So results are additionally persisted
+        to `self._artwork_cache` (disk, keyed by uri + updated_at) --
+        skipped when updated_at is unavailable, since there's nothing
+        reliable to invalidate on.
         """
         playlist = self._backend.playlists._get_playlist(uri)
         if playlist is None:
             return ()
 
+        updated_at = getattr(playlist, "updated_at", None)
+        if updated_at is not None:
+            cached = self._artwork_cache.get(uri, updated_at)
+            if cached is not None:
+                return [models.Image(**image) for image in cached]
+
+        images = self._derive_playlist_images(playlist)
+        if updated_at is not None:
+            self._artwork_cache.put(
+                uri,
+                updated_at,
+                [
+                    {"uri": img.uri, "width": img.width, "height": img.height}
+                    for img in images
+                ],
+            )
+        return images
+
+    @staticmethod
+    def _derive_playlist_images(playlist):
         # Prefer the service-provided mosaic from the list payload
         for field, size in _PLAYLIST_IMAGE_FIELDS:
             urls = _distinct_urls(getattr(playlist, field, None) or [])
