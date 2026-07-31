@@ -32,6 +32,17 @@ FIRST_SLICE_SIZE = 50
 # from disk are skipped.
 EAGER_PREFETCH_COUNT = 5
 
+
+def _cfg_int(config, key, default):
+    """Read an optional integer config key, falling back to `default` on an
+    absent, empty, or invalid value -- config must never crash the extension."""
+    try:
+        value = config.get(key)
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 # Fallback when playlist_cache_ttl is not configured (see ext.conf)
 DEFAULT_CACHE_TTL = 300
 
@@ -77,6 +88,12 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
 
         config = backend._config["qobuz"]
         ttl = config.get("playlist_cache_ttl") or DEFAULT_CACHE_TTL
+        # Optional overrides, read defensively so an absent/invalid key can never
+        # crash startup; the built-in defaults above are sensible on their own.
+        self._first_page_size = _cfg_int(config, "first_page_size", FIRST_SLICE_SIZE)
+        self._eager_prefetch_count = _cfg_int(
+            config, "eager_prefetch_count", EAGER_PREFETCH_COUNT
+        )
         # The user playlist snapshot ({uri: Playlist}) lives outside the TTL
         # cache so unchanged playlists keep their already-loaded tracks
         # across refreshes; the TTL cache acts as the freshness timer and
@@ -174,10 +191,10 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         try:
             _pf = time.time()
             warmed = 0
-            for uri in list(self._snapshot.keys())[:EAGER_PREFETCH_COUNT]:
+            for uri in list(self._snapshot.keys())[:self._eager_prefetch_count]:
                 pl = self._snapshot.get(uri)
                 if pl is not None and pl._tracks is None:
-                    pl.first_tracks_page(FIRST_SLICE_SIZE)
+                    pl.first_tracks_page(self._first_page_size)
                     warmed += 1
             logger.info(
                 "[SYNC_TIMING] qobuz eager first-page prefetch complete "
@@ -252,7 +269,7 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         if playlist._tracks is not None:
             return playlist._tracks, False
 
-        first = playlist.first_tracks_page(FIRST_SLICE_SIZE)
+        first = playlist.first_tracks_page(self._first_page_size)
         total = playlist.tracks_count
         if total is None or total > len(first):
             # More tracks upstream (or count unknown): serve the slice now and
@@ -374,9 +391,15 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         # before, so dict equality doubles as an identity-based change check
         changed = snapshot != self._snapshot
         self._snapshot = snapshot
-        # Keep the on-disk tracks cache from growing without bound as
-        # playlists come and go.
+        # Keep the on-disk caches from growing without bound as playlists come
+        # and go -- prune both the tracks and the derived-artwork caches to the
+        # live set. The artwork cache lives on the library provider; guard the
+        # access so a missing/uninitialised library never breaks a refresh.
         self._tracks_disk.prune(snapshot.keys())
+        try:
+            self._backend.library._artwork_cache.prune(snapshot.keys())
+        except Exception:
+            logger.debug("Could not prune artwork cache", exc_info=True)
         self._playlists.put(_LIST_KEY, True)
         logger.info(
             "[SYNC_TIMING] qobuz refresh hydrated %d/%d playlists from disk cache",

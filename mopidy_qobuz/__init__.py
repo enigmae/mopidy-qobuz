@@ -51,6 +51,9 @@ class Extension(ext.Extension):
         schema["search_artist_count"] = config.Integer()
         schema["search_track_count"] = config.Integer()
         schema["search_album_count"] = config.Integer()
+        # Optional playlist-load tuning (absent -> built-in defaults 50 / 5).
+        schema["first_page_size"] = config.Integer(optional=True, minimum=1)
+        schema["eager_prefetch_count"] = config.Integer(optional=True, minimum=0)
 
         # Playlist settings
         schema["playlist_track_limit"] = config.Integer(optional=True)
