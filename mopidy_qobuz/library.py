@@ -50,7 +50,30 @@ class QobuzLibraryProvider(backend.LibraryProvider):
         if not uri or not uri.startswith("qobuz"):
             return []
 
+        if uri.startswith("qobuz:playlist:"):
+            # Serve playlist contents through the playlists provider so its
+            # snapshot / disk cache / first-slice machinery is reused instead
+            # of re-paging the whole playlist on every browse.
+            refs = self._browse_playlist_fast(uri)
+            if refs is not None:
+                return refs
+
         return browse(uri, self._backend._client, self._config)
+
+    def _browse_playlist_fast(self, uri):
+        """Track refs for a playlist via the playlists provider's caches.
+
+        Returns None when the provider can't serve the URI so the caller
+        falls back to the direct (slow) browse path.
+        """
+        provider = getattr(self._backend, "playlists", None)
+        if provider is None:
+            return None
+        try:
+            return provider.get_items(uri)
+        except Exception:
+            logger.exception("Provider-backed browse failed for %s", uri)
+            return None
 
     def lookup(self, uris=None):
         if not uris:
@@ -62,6 +85,11 @@ class QobuzLibraryProvider(backend.LibraryProvider):
 
         client = self._backend._client
         tracks = []
+        # Built lazily, at most once per lookup call: queueing a whole
+        # playlist arrives as ONE lookup with hundreds of track URIs, so
+        # resolve them from tracks already held by the playlists provider
+        # instead of one rate-limited track/get call each.
+        track_index = None
         for uri in uris:
             if not uri.startswith("qobuz:"):
                 continue
@@ -69,7 +97,7 @@ class QobuzLibraryProvider(backend.LibraryProvider):
             type = uri.split(":")[1]
             id = uri.split(":")[-1]
 
-            # TODO: add artist and playlist support
+            # TODO: add artist support
             if type == "album":
                 # Request album with embedded tracks to avoid individual track/get calls
                 album = Album.from_id(client, id, extra="tracks")
@@ -80,18 +108,58 @@ class QobuzLibraryProvider(backend.LibraryProvider):
                 tracks.extend([translators.to_track(track) for track in artist.tracks])
 
             elif type == "playlist":
-                playlist = Playlist.from_id(client, id)
-                tracks.extend(
-                    [translators.to_track(track) for track in playlist.tracks]
-                )
+                tracks.extend(self._playlist_tracks(uri, id))
 
             elif type == "track":
-                tracks.append(translators.to_track(Track.from_id(client, id)))
+                if track_index is None:
+                    track_index = self._loaded_track_index()
+                known = track_index.get(uri)
+                if known is not None:
+                    tracks.append(translators.to_track(known))
+                else:
+                    tracks.append(translators.to_track(Track.from_id(client, id)))
 
             else:
                 logger.debug("Ignoring non-supported type: %s", type)
 
         return _filter_none(tracks)
+
+    def _playlist_tracks(self, uri, playlist_id):
+        """Complete translated track list for a playlist.
+
+        Goes through the playlists provider (memory snapshot, on-disk track
+        cache, in-flight backfill reuse) so repeated plays never re-page the
+        whole playlist from the API -- the pre-existing direct
+        Playlist.from_id() path built a throwaway object and re-fetched
+        every page on every single call. Falls back to that direct path
+        only when the provider can't serve the URI.
+        """
+        provider = getattr(self._backend, "playlists", None)
+        if provider is not None:
+            try:
+                playlist = provider._get_playlist(uri)
+                if playlist is not None:
+                    return [
+                        translators.to_track(track)
+                        for track in provider.full_tracks(playlist)
+                    ]
+            except Exception:
+                logger.exception("Provider-backed playlist lookup failed for %s", uri)
+
+        playlist = Playlist.from_id(self._backend._client, playlist_id)
+        return [translators.to_track(track) for track in playlist.tracks]
+
+    def _loaded_track_index(self):
+        """{track uri: client Track} from the playlists provider, or an
+        empty dict when the provider is unavailable."""
+        provider = getattr(self._backend, "playlists", None)
+        if provider is None:
+            return {}
+        try:
+            return provider.loaded_track_index()
+        except Exception:
+            logger.exception("Could not build the loaded-track index")
+            return {}
 
     def search(self, query, uris=None, exact=False):
         if not query:

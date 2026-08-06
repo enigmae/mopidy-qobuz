@@ -285,6 +285,66 @@ class QobuzPlaylistsProvider(backend.PlaylistsProvider):
         )
         return first, False
 
+    def full_tracks(self, playlist, backfill_wait_secs=90.0):
+        """Complete track list for a playlist -- NEVER a partial slice.
+
+        The playback/library path (core.tracklist.add of a playlist URI,
+        library.lookup) needs every track, unlike the view path served by
+        `_tracks_for_open`. Resolution order, cheapest first:
+        already-loaded -> disk hydrate -> wait for an in-flight view
+        backfill -> ONE blocking full page-through, pinned on the shared
+        snapshot object and persisted to disk so it never re-pages again.
+        """
+        if playlist._tracks is not None:
+            return playlist._tracks
+        if self._hydrate_tracks_from_disk(playlist):
+            return playlist._tracks
+
+        # A view-open may already be backfilling this playlist in the
+        # background; wait for it rather than racing a duplicate full
+        # page-through of the same tracks.
+        uri = playlist.uri
+        deadline = time.time() + backfill_wait_secs
+        while time.time() < deadline:
+            with self._backfill_lock:
+                inflight = uri in self._backfilling
+            if not inflight:
+                break
+            time.sleep(0.2)
+        if playlist._tracks is not None:
+            return playlist._tracks
+
+        _start = time.time()
+        tracks = playlist.tracks  # full paged load; pins playlist._tracks
+        self._tracks_disk.put(
+            uri, playlist.updated_at, [track._raw for track in tracks]
+        )
+        logger.info(
+            "[SYNC_TIMING] qobuz full_tracks blocking load uri=%s tracks=%d "
+            "duration=%.2fs",
+            uri,
+            len(tracks),
+            time.time() - _start,
+        )
+        return tracks
+
+    def loaded_track_index(self):
+        """{track uri: client Track} across every playlist whose tracks
+        (full list or first page) are already in memory.
+
+        Built on demand by the library provider so a batched track lookup
+        (queueing a whole playlist fires ONE library.lookup with hundreds
+        of track URIs) resolves from tracks we already hold instead of one
+        rate-limited track/get call per track.
+        """
+        index = {}
+        for playlist in list(self._snapshot.values()):
+            for track_list in (playlist._tracks, playlist._first_tracks_page):
+                if track_list:
+                    for track in track_list:
+                        index.setdefault(track.uri, track)
+        return index
+
     def _schedule_backfill(self, playlist):
         uri = playlist.uri
         with self._backfill_lock:
