@@ -192,6 +192,18 @@ class PlaylistArtworkDiskCache:
             self._data[uri] = {"updated_at": updated_at, "images": images}
             self._persist()
 
+    def prune(self, live_uris):
+        """Drop cached artwork for playlists no longer in the snapshot, so the
+        file doesn't grow unbounded with orphans as playlists come and go
+        (mirrors PlaylistTracksDiskCache.prune)."""
+        live = set(live_uris)
+        with self._lock:
+            stale = [uri for uri in self._data if uri not in live]
+            for uri in stale:
+                del self._data[uri]
+            if stale:
+                self._persist()
+
 
 class PlaylistTracksDiskCache:
     """Disk-persisted cache of a playlist's fully-loaded track list, keyed
